@@ -10,11 +10,11 @@ const summarizeLen = 30
 
 type SummarizeOption func(*summarizeConfig)
 
-func SummarizeWithLimit(limit int) SummarizeOption {
+func WithSummarizeLimit(limit int) SummarizeOption {
 	return func(c *summarizeConfig) { c.limit = &limit }
 }
 
-func SummarizeWithName(name string) SummarizeOption {
+func WithSummarizeName(name string) SummarizeOption {
 	return func(c *summarizeConfig) { c.name = datautil.ToPtr(name) }
 }
 

@@ -80,7 +80,7 @@ func TestSummarizeSlice(t *testing.T) {
 			input[i] = i
 		}
 		customLimit := 5
-		result := SummarizeSlice(input, SummarizeWithLimit(customLimit))
+		result := SummarizeSlice(input, WithSummarizeLimit(customLimit))
 		summary, ok := result.(map[string]any)
 		assert.True(t, ok)
 		assert.Equal(t, 50, summary["total"])
@@ -93,7 +93,7 @@ func TestSummarizeSlice(t *testing.T) {
 
 	t.Run("custom limit larger than total returns original", func(t *testing.T) {
 		input := []int{1, 2, 3}
-		result := SummarizeSlice(input, SummarizeWithLimit(100))
+		result := SummarizeSlice(input, WithSummarizeLimit(100))
 		summary, ok := result.(map[string]any)
 		assert.True(t, ok)
 		assert.Equal(t, input, summary["sample"])
@@ -102,7 +102,7 @@ func TestSummarizeSlice(t *testing.T) {
 
 	t.Run("custom name changes sample key", func(t *testing.T) {
 		input := []int{1, 2, 3}
-		result := SummarizeSlice(input, SummarizeWithName("items"))
+		result := SummarizeSlice(input, WithSummarizeName("items"))
 		summary, ok := result.(map[string]any)
 		assert.True(t, ok)
 		assert.Equal(t, input, summary["items"])
@@ -112,7 +112,7 @@ func TestSummarizeSlice(t *testing.T) {
 
 	t.Run("negative limit becomes zero and samples empty", func(t *testing.T) {
 		input := []int{1, 2, 3}
-		result := SummarizeSlice(input, SummarizeWithLimit(-5))
+		result := SummarizeSlice(input, WithSummarizeLimit(-5))
 		summary, ok := result.(map[string]any)
 		assert.True(t, ok)
 		assert.Equal(t, 3, summary["total"])
@@ -128,8 +128,8 @@ func TestSummarizeSlice(t *testing.T) {
 			input[i] = i
 		}
 		result := SummarizeSlice(input,
-			SummarizeWithName("top"),
-			SummarizeWithLimit(2),
+			WithSummarizeName("top"),
+			WithSummarizeLimit(2),
 		)
 		summary, ok := result.(map[string]any)
 		assert.True(t, ok)
@@ -170,7 +170,7 @@ func TestSummarizeMap(t *testing.T) {
 		for i := 0; i < total; i++ {
 			input[i] = i * 2
 		}
-		result := SummarizeMap(input, SummarizeWithLimit(5))
+		result := SummarizeMap(input, WithSummarizeLimit(5))
 		summary, ok := result.(map[string]any)
 		assert.True(t, ok)
 		assert.Equal(t, total, summary["total"])
@@ -217,7 +217,7 @@ func TestSummarizeMap(t *testing.T) {
 
 	t.Run("custom name changes sample key", func(t *testing.T) {
 		input := map[string]int{"a": 1}
-		result := SummarizeMap(input, SummarizeWithName("entry"))
+		result := SummarizeMap(input, WithSummarizeName("entry"))
 		summary, ok := result.(map[string]any)
 		assert.True(t, ok)
 		assert.Equal(t, input, summary["entry"])
@@ -227,7 +227,7 @@ func TestSummarizeMap(t *testing.T) {
 
 	t.Run("negative limit becomes zero for sampling", func(t *testing.T) {
 		input := map[string]int{"a": 1, "b": 2, "c": 3}
-		result := SummarizeMap(input, SummarizeWithLimit(-1))
+		result := SummarizeMap(input, WithSummarizeLimit(-1))
 		summary, ok := result.(map[string]any)
 		assert.True(t, ok)
 		assert.Equal(t, 3, summary["total"])
@@ -239,7 +239,7 @@ func TestSummarizeMap(t *testing.T) {
 
 	t.Run("zero limit samples empty map", func(t *testing.T) {
 		input := map[string]int{"a": 1, "b": 2}
-		result := SummarizeMap(input, SummarizeWithLimit(0))
+		result := SummarizeMap(input, WithSummarizeLimit(0))
 		summary, ok := result.(map[string]any)
 		assert.True(t, ok)
 		assert.Equal(t, 2, summary["total"])
@@ -252,24 +252,24 @@ func TestSummarizeMap(t *testing.T) {
 
 func TestSummarizeWithLimit(t *testing.T) {
 	t.Run("SummarizeWithLimit returns a function", func(t *testing.T) {
-		opt := SummarizeWithLimit(10)
+		opt := WithSummarizeLimit(10)
 		assert.NotNil(t, opt)
 	})
 
 	t.Run("SummarizeWithLimit applied via config", func(t *testing.T) {
-		c := newSummarizeConfig(SummarizeWithLimit(5))
+		c := newSummarizeConfig(WithSummarizeLimit(5))
 		assert.Equal(t, 5, *c.limit)
 	})
 }
 
 func TestSummarizeWithName(t *testing.T) {
 	t.Run("SummarizeWithName returns a function", func(t *testing.T) {
-		opt := SummarizeWithName("custom")
+		opt := WithSummarizeName("custom")
 		assert.NotNil(t, opt)
 	})
 
 	t.Run("SummarizeWithName applied via config", func(t *testing.T) {
-		c := newSummarizeConfig(SummarizeWithName("custom"))
+		c := newSummarizeConfig(WithSummarizeName("custom"))
 		assert.Equal(t, "custom", *c.name)
 	})
 }
@@ -282,19 +282,19 @@ func TestNewSummarizeConfig(t *testing.T) {
 	})
 
 	t.Run("negative limit clamped to zero", func(t *testing.T) {
-		c := newSummarizeConfig(SummarizeWithLimit(-10))
+		c := newSummarizeConfig(WithSummarizeLimit(-10))
 		assert.Equal(t, 0, *c.limit)
 	})
 
 	t.Run("zero limit stays zero", func(t *testing.T) {
-		c := newSummarizeConfig(SummarizeWithLimit(0))
+		c := newSummarizeConfig(WithSummarizeLimit(0))
 		assert.Equal(t, 0, *c.limit)
 	})
 
 	t.Run("multiple options applied in order", func(t *testing.T) {
 		c := newSummarizeConfig(
-			SummarizeWithLimit(50),
-			SummarizeWithName("data"),
+			WithSummarizeLimit(50),
+			WithSummarizeName("data"),
 		)
 		assert.Equal(t, 50, *c.limit)
 		assert.Equal(t, "data", *c.name)
