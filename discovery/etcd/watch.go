@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
-	"github.com/openimsdk/tools/discovery"
-	"github.com/openimsdk/tools/log"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+
+	"github.com/openimsdk/tools/discovery"
+	"github.com/openimsdk/tools/log"
 )
 
 type watchKeyEntry struct {
@@ -48,7 +50,7 @@ func (e *watchKeyEntry) removeSubscriber(sub *watchKeySubscriber) bool {
 	return empty
 }
 
-func (e *watchKeyEntry) broadcast(r *SvcDiscoveryRegistryImpl, event *discovery.WatchKey) {
+func (e *watchKeyEntry) broadcast(h *kvHub, event *discovery.WatchKey) {
 	e.mu.RLock()
 	if len(e.subs) == 0 {
 		e.mu.RUnlock()
@@ -62,7 +64,7 @@ func (e *watchKeyEntry) broadcast(r *SvcDiscoveryRegistryImpl, event *discovery.
 
 	for _, sub := range subs {
 		if !sub.push(event) {
-			r.removeWatchKeySubscriber(e.key, e, sub)
+			h.removeWatchKeySubscriber(e.key, e, sub)
 		}
 	}
 }
@@ -99,110 +101,78 @@ func (s *watchKeySubscriber) push(event *discovery.WatchKey) bool {
 	}
 }
 
-func (e *watchKeyEntry) run(r *SvcDiscoveryRegistryImpl) {
+func (e *watchKeyEntry) run(h *kvHub) {
 	defer func() {
 		e.closeSubscribers()
-		r.removeWatchKeyEntry(e.key, e)
+		h.removeWatchKeyEntry(e.key, e)
 	}()
 
-	watchChan := r.client.Watch(e.ctx, e.key, clientv3.WithPrefix())
+	delay := 100 * time.Millisecond
 	for {
 		select {
 		case <-e.ctx.Done():
 			return
-		case resp, ok := <-watchChan:
-			if !ok {
-				return
-			}
-			if resp.Err() != nil {
-				log.ZWarn(context.Background(), "watch key resp err", resp.Err(), zap.String("key", e.key))
-				continue
-			}
-			for _, event := range resp.Events {
-				watchKey := &discovery.WatchKey{Key: event.Kv.Key, Value: event.Kv.Value}
-				switch event.Type {
-				case mvccpb.PUT:
-					watchKey.Type = discovery.WatchTypePut
-				case mvccpb.DELETE:
-					watchKey.Type = discovery.WatchTypeDelete
-				default:
-					continue
-				}
-				e.broadcast(r, watchKey)
-			}
+		default:
 		}
-	}
-}
 
-// watchServiceChanges watches for changes in the service directory
-func (r *SvcDiscoveryRegistryImpl) watchServiceChanges() {
-	for _, s := range r.watchNames {
-		if err := r.ensureServiceWatch(s); err != nil {
-			log.ZWarn(context.Background(), "ensure service watch err", err, zap.String("service", s))
-		}
-	}
-}
-
-func (r *SvcDiscoveryRegistryImpl) ensureServiceWatch(service string) error {
-	r.serviceWatchMu.Lock()
-	if _, exists := r.serviceWatchers[service]; exists {
-		r.serviceWatchMu.Unlock()
-		return nil
-	}
-
-	if r.client == nil {
-		r.serviceWatchMu.Unlock()
-		return fmt.Errorf("etcd client closed")
-	}
-
-	watchCtx, cancel := context.WithCancel(context.Background())
-	r.serviceWatchers[service] = cancel
-	r.serviceWatchMu.Unlock()
-
-	go r.runServiceWatch(watchCtx, service)
-
-	return nil
-}
-
-func (r *SvcDiscoveryRegistryImpl) runServiceWatch(ctx context.Context, service string) {
-	watchChan := r.client.Watch(ctx, r.combineKeyWithPrefix(service), clientv3.WithPrefix())
-	for {
-		select {
-		case <-ctx.Done():
+		client := h.client
+		if client == nil {
 			return
-		case _, ok := <-watchChan:
-			if !ok {
+		}
+
+		getCtx, getCancel := context.WithTimeout(e.ctx, 5*time.Second)
+		_, _ = client.Get(getCtx, e.key, clientv3.WithKeysOnly(), clientv3.WithLimit(1))
+		getCancel()
+
+		if e.ctx.Err() != nil {
+			return
+		}
+
+		watchChan := client.Watch(e.ctx, e.key, clientv3.WithPrefix())
+		for {
+			select {
+			case <-e.ctx.Done():
 				return
-			}
-			if err := r.initializeConnMap(service); err != nil {
-				log.ZWarn(context.Background(), "initializeConnMap in watch err", err, zap.String("service", service))
+			case resp, ok := <-watchChan:
+				if !ok {
+					goto reconnect
+				}
+				if err := resp.Err(); err != nil {
+					log.ZWarn(context.Background(), "watch key resp err", err, zap.String("key", e.key))
+					goto reconnect
+				}
+				delay = 100 * time.Millisecond
+				for _, event := range resp.Events {
+					watchKey := &discovery.WatchKey{Key: event.Kv.Key, Value: event.Kv.Value}
+					switch event.Type {
+					case mvccpb.PUT:
+						watchKey.Type = discovery.WatchTypePut
+					case mvccpb.DELETE:
+						watchKey.Type = discovery.WatchTypeDelete
+					default:
+						continue
+					}
+					e.broadcast(h, watchKey)
+				}
 			}
 		}
+
+	reconnect:
+		if !sleepWithContext(e.ctx, delay) {
+			return
+		}
+		delay = min(delay*2, 3*time.Second)
 	}
 }
 
-func (r *SvcDiscoveryRegistryImpl) stopServiceWatches() {
-	r.serviceWatchMu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(r.serviceWatchers))
-	for _, cancel := range r.serviceWatchers {
-		cancels = append(cancels, cancel)
-	}
-	r.serviceWatchers = make(map[string]context.CancelFunc)
-	r.serviceWatchMu.Unlock()
-
-	for _, cancel := range cancels {
-		cancel()
-	}
-}
-
-func (r *SvcDiscoveryRegistryImpl) stopKeyWatches() {
-	r.watchKeyMu.Lock()
-	entries := make([]*watchKeyEntry, 0, len(r.watchKeyEntries))
-	for _, entry := range r.watchKeyEntries {
+func (h *kvHub) stopKeyWatches() {
+	h.watchMu.Lock()
+	entries := make([]*watchKeyEntry, 0, len(h.watchEntries))
+	for _, entry := range h.watchEntries {
 		entries = append(entries, entry)
 	}
-	r.watchKeyEntries = make(map[string]*watchKeyEntry)
-	r.watchKeyMu.Unlock()
+	h.watchEntries = make(map[string]*watchKeyEntry)
+	h.watchMu.Unlock()
 
 	for _, entry := range entries {
 		if entry.cancel != nil {
@@ -211,14 +181,14 @@ func (r *SvcDiscoveryRegistryImpl) stopKeyWatches() {
 	}
 }
 
-func (r *SvcDiscoveryRegistryImpl) getOrCreateWatchKeyEntry(key string) (*watchKeyEntry, error) {
-	r.watchKeyMu.Lock()
-	if entry, ok := r.watchKeyEntries[key]; ok {
-		r.watchKeyMu.Unlock()
+func (h *kvHub) getOrCreateWatchKeyEntry(key string) (*watchKeyEntry, error) {
+	h.watchMu.Lock()
+	if entry, ok := h.watchEntries[key]; ok {
+		h.watchMu.Unlock()
 		return entry, nil
 	}
-	if r.client == nil {
-		r.watchKeyMu.Unlock()
+	if h.client == nil {
+		h.watchMu.Unlock()
 		return nil, fmt.Errorf("etcd client closed")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -228,14 +198,14 @@ func (r *SvcDiscoveryRegistryImpl) getOrCreateWatchKeyEntry(key string) (*watchK
 		cancel: cancel,
 		subs:   make(map[*watchKeySubscriber]struct{}),
 	}
-	r.watchKeyEntries[key] = entry
-	r.watchKeyMu.Unlock()
+	h.watchEntries[key] = entry
+	h.watchMu.Unlock()
 
-	go entry.run(r)
+	go entry.run(h)
 	return entry, nil
 }
 
-func (r *SvcDiscoveryRegistryImpl) removeWatchKeySubscriber(key string, entry *watchKeyEntry, sub *watchKeySubscriber) {
+func (h *kvHub) removeWatchKeySubscriber(key string, entry *watchKeyEntry, sub *watchKeySubscriber) {
 	if sub == nil || entry == nil {
 		return
 	}
@@ -245,26 +215,26 @@ func (r *SvcDiscoveryRegistryImpl) removeWatchKeySubscriber(key string, entry *w
 		return
 	}
 
-	r.watchKeyMu.Lock()
-	if current, ok := r.watchKeyEntries[key]; ok && current == entry {
-		delete(r.watchKeyEntries, key)
+	h.watchMu.Lock()
+	if current, ok := h.watchEntries[key]; ok && current == entry {
+		delete(h.watchEntries, key)
 	}
-	r.watchKeyMu.Unlock()
+	h.watchMu.Unlock()
 
 	if entry.cancel != nil {
 		entry.cancel()
 	}
 }
 
-func (r *SvcDiscoveryRegistryImpl) removeWatchKeyEntry(key string, entry *watchKeyEntry) {
-	r.watchKeyMu.Lock()
-	if current, ok := r.watchKeyEntries[key]; ok && current == entry {
-		delete(r.watchKeyEntries, key)
+func (h *kvHub) removeWatchKeyEntry(key string, entry *watchKeyEntry) {
+	h.watchMu.Lock()
+	if current, ok := h.watchEntries[key]; ok && current == entry {
+		delete(h.watchEntries, key)
 	}
-	r.watchKeyMu.Unlock()
+	h.watchMu.Unlock()
 }
 
-func (r *SvcDiscoveryRegistryImpl) WatchKey(ctx context.Context, key string, fn discovery.WatchKeyHandler) error {
+func (h *kvHub) WatchKey(ctx context.Context, key string, fn discovery.WatchKeyHandler) error {
 	if ctx == nil {
 		return fmt.Errorf("context is nil")
 	}
@@ -272,9 +242,9 @@ func (r *SvcDiscoveryRegistryImpl) WatchKey(ctx context.Context, key string, fn 
 		return fmt.Errorf("watch handler is nil")
 	}
 
-	key = r.combineKeyWithPrefix(key)
+	key = h.combineKeyWithPrefix(key)
 
-	entry, err := r.getOrCreateWatchKeyEntry(key)
+	entry, err := h.getOrCreateWatchKeyEntry(key)
 	if err != nil {
 		return err
 	}
@@ -287,7 +257,7 @@ func (r *SvcDiscoveryRegistryImpl) WatchKey(ctx context.Context, key string, fn 
 	}
 
 	entry.addSubscriber(sub)
-	defer r.removeWatchKeySubscriber(key, entry, sub)
+	defer h.removeWatchKeySubscriber(key, entry, sub)
 
 	for {
 		select {
@@ -304,4 +274,9 @@ func (r *SvcDiscoveryRegistryImpl) WatchKey(ctx context.Context, key string, fn 
 			}
 		}
 	}
+}
+
+func (h *kvHub) close() {
+	h.stopKeyWatches()
+	h.stopKVKeepAlives()
 }
