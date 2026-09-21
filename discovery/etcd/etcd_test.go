@@ -38,6 +38,7 @@ func getEtcd() *SvcDiscoveryRegistryImpl {
 }
 
 func TestGetConn(t *testing.T) {
+	t.Skip("skipping manual test requiring live local etcd cluster")
 	r := getEtcd()
 	for i := 1; ; i++ {
 		cs, err := r.GetConns(context.Background(), testServerName)
@@ -51,6 +52,7 @@ func TestGetConn(t *testing.T) {
 }
 
 func TestWatch(t *testing.T) {
+	t.Skip("skipping manual test requiring live local etcd cluster")
 	r := getEtcd()
 	t.Log("start watch")
 	for i := 0; i < 5; i++ {
@@ -78,6 +80,7 @@ func TestWatch(t *testing.T) {
 }
 
 func TestGetValue(t *testing.T) {
+	t.Skip("skipping manual test requiring live local etcd cluster")
 	r := getEtcd()
 	t.Log("start watch")
 	val, err := r.GetKeyWithPrefix(context.Background(), "test-user")
@@ -88,6 +91,7 @@ func TestGetValue(t *testing.T) {
 }
 
 func TestRegister(t *testing.T) {
+	t.Skip("skipping manual test requiring live local etcd cluster")
 	r := getEtcd()
 	l, err := net.Listen("tcp", ":0")
 	if err != nil {
@@ -111,6 +115,7 @@ func TestRegister(t *testing.T) {
 }
 
 func TestWatch1(t *testing.T) {
+	t.Skip("skipping manual test requiring live local etcd cluster")
 	r := getEtcd()
 	t.Log("start watch")
 	err := r.WatchKey(context.Background(), testServerName, func(data *discovery.WatchKey) error {
