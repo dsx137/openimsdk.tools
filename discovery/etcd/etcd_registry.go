@@ -108,6 +108,13 @@ func (r *registrar) registerLocked(ctx context.Context, serviceName, host string
 	r.host = host
 	r.port = port
 
+	log.ZInfo(ctx, "rpc register success",
+		"service", serviceName,
+		"serviceKey", serviceKey,
+		"target", endpointAddr,
+		"leaseID", int64(leaseResp.ID),
+	)
+
 	return nil
 }
 
@@ -252,12 +259,15 @@ func (r *registrar) UnRegister() error {
 	}
 
 	if err := mgr.DeleteEndpoint(ctx, serviceKey); err != nil {
+		log.ZWarn(ctx, "failed to delete endpoint during unregister", err, "serviceKey", serviceKey)
 		return err
 	}
 
+	log.ZInfo(ctx, "rpc unregister success", "serviceKey", serviceKey)
+
 	if leaseID != 0 && client != nil {
 		if _, err := client.Revoke(ctx, leaseID); err != nil {
-			log.ZWarn(ctx, "failed to revoke lease during unregister", err, zap.String("serviceKey", serviceKey))
+			log.ZWarn(ctx, "failed to revoke lease during unregister", err, "serviceKey", serviceKey)
 		}
 	}
 

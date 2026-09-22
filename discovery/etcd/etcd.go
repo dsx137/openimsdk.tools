@@ -1,11 +1,14 @@
 package etcd
 
 import (
+	"context"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 
+	"github.com/openimsdk/tools/log"
 	"github.com/openimsdk/tools/utils/datautil"
 )
 
@@ -40,10 +43,18 @@ func NewSvcDiscoveryRegistry(rootDirectory string, endpoints []string, watchName
 	// Apply provided options to the config
 	datautil.Foreach(options, func(option CfgOption) { option(&cfg) })
 
+	cfg.DialOptions = append(cfg.DialOptions, grpc.WithStatsHandler(etcdRPCDiagnostics{}))
+
 	client, err := clientv3.New(cfg)
 	if err != nil {
 		return nil, err
 	}
+
+	log.ZInfo(context.Background(), "etcd client created",
+		"endpoints", cfg.Endpoints,
+		"rootDirectory", rootDirectory,
+		"authConfigured", cfg.Username != "",
+	)
 
 	return &SvcDiscoveryRegistryImpl{
 		client:        client,

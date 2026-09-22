@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,8 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/naming/endpoints"
 	"google.golang.org/grpc/resolver"
+
+	"github.com/openimsdk/tools/log"
 )
 
 type resolverBuilder struct {
@@ -130,6 +133,10 @@ func (watcher *endpointResolver) run(ctx context.Context) {
 		if watcher.conn != nil {
 			watcher.conn.ReportError(err)
 		}
+		log.ZWarn(ctx, "etcd resolver watch failed, retrying", err,
+			"prefix", watcher.prefix,
+			"retryDelay", delay,
+		)
 		if !sleepWithContext(ctx, delay) {
 			return
 		}
@@ -189,22 +196,34 @@ func (watcher *endpointResolver) watchSnapshot(parent context.Context, recovered
 
 func (watcher *endpointResolver) setAddress(addresses map[string]resolver.Address, key string, value []byte) {
 	var endpoint endpoints.Endpoint
-	if err := json.Unmarshal(value, &endpoint); err == nil && endpoint.Addr != "" {
+	if err := json.Unmarshal(value, &endpoint); err == nil && isValidHostPort(endpoint.Addr) {
 		addresses[key] = resolver.Address{Addr: endpoint.Addr, Metadata: endpoint.Metadata}
 		return
 	}
 	if lastSlash := strings.LastIndex(key, "/"); lastSlash != -1 && lastSlash < len(key)-1 {
 		addr := key[lastSlash+1:]
-		if addr != "" {
-			if _, _, err := net.SplitHostPort(addr); err == nil {
-				addresses[key] = resolver.Address{Addr: addr}
-				return
-			}
+		if isValidHostPort(addr) {
+			addresses[key] = resolver.Address{Addr: addr}
+			return
 		}
 	}
 	if watcher.conn != nil {
-		watcher.conn.ReportError(fmt.Errorf("invalid endpoint value at %s: %s", key, string(value)))
+		err := fmt.Errorf("invalid endpoint value at %s: %s", key, string(value))
+		log.ZWarn(context.Background(), "invalid endpoint in etcd", err,
+			"key", key,
+			"prefix", watcher.prefix,
+		)
+		watcher.conn.ReportError(err)
 	}
+}
+
+func isValidHostPort(addr string) bool {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return false
+	}
+	port, err := strconv.Atoi(portStr)
+	return err == nil && port > 0 && port <= 65535
 }
 
 func (watcher *endpointResolver) publish(addresses map[string]resolver.Address) {
@@ -220,6 +239,10 @@ func (watcher *endpointResolver) publish(addresses map[string]resolver.Address) 
 	state := resolver.State{Addresses: addrs}
 	if watcher.conn != nil {
 		if err := watcher.conn.UpdateState(state); err != nil {
+			log.ZWarn(context.Background(), "etcd resolver update state failed", err,
+				"prefix", watcher.prefix,
+				"addrCount", len(addrs),
+			)
 			watcher.conn.ReportError(err)
 		}
 	}
