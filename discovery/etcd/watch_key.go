@@ -2,11 +2,13 @@ package etcd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 
@@ -102,6 +104,13 @@ func (s *watchKeySubscriber) push(event *discovery.WatchKey) bool {
 }
 
 func (e *watchKeyEntry) run(h *kvHub) {
+	var sdkWatcher clientv3.Watcher
+	var ownedWatcher clientv3.Watcher
+	defer func() {
+		if ownedWatcher != nil {
+			_ = ownedWatcher.Close()
+		}
+	}()
 	defer func() {
 		e.closeSubscribers()
 		h.removeWatchKeyEntry(e.key, e)
@@ -119,16 +128,24 @@ func (e *watchKeyEntry) run(h *kvHub) {
 		if client == nil {
 			return
 		}
+		if sdkWatcher == nil {
+			sdkWatcher = client.Watcher
+		}
+		var watchChan clientv3.WatchChan
 
 		getCtx, getCancel := context.WithTimeout(e.ctx, 5*time.Second)
-		_, _ = client.Get(getCtx, e.key, clientv3.WithKeysOnly(), clientv3.WithLimit(1))
+		_, err := client.Get(getCtx, e.key, clientv3.WithKeysOnly(), clientv3.WithLimit(1))
 		getCancel()
+		if err != nil {
+			log.ZWarn(e.ctx, "watch key snapshot err", err, zap.String("key", e.key))
+			goto reconnect
+		}
 
 		if e.ctx.Err() != nil {
 			return
 		}
 
-		watchChan := client.Watch(e.ctx, e.key, clientv3.WithPrefix())
+		watchChan = sdkWatcher.Watch(e.ctx, e.key, clientv3.WithPrefix())
 		for {
 			select {
 			case <-e.ctx.Done():
@@ -138,6 +155,14 @@ func (e *watchKeyEntry) run(h *kvHub) {
 					goto reconnect
 				}
 				if err := resp.Err(); err != nil {
+					err = rpctypes.Error(err)
+					if errors.Is(err, rpctypes.ErrInvalidAuthToken) || errors.Is(err, rpctypes.ErrAuthOldRevision) {
+						if ownedWatcher != nil {
+							_ = ownedWatcher.Close()
+						}
+						ownedWatcher = clientv3.NewWatcher(client)
+						sdkWatcher = ownedWatcher
+					}
 					log.ZWarn(context.Background(), "watch key resp err", err, zap.String("key", e.key))
 					goto reconnect
 				}

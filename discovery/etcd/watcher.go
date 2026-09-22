@@ -116,7 +116,7 @@ func (watcher *endpointWatcher) waitReady(ctx context.Context) error {
 	case <-watcher.ready:
 		return nil
 	case <-watcher.done:
-		return errors.New("etcd resolver: closed")
+		return errors.New("etcd watcher: closed")
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -124,16 +124,28 @@ func (watcher *endpointWatcher) waitReady(ctx context.Context) error {
 
 func (watcher *endpointWatcher) run(ctx context.Context) {
 	defer close(watcher.done)
+	source := watcher.client.Watcher
+	var owned clientv3.Watcher
+	defer func() {
+		if owned != nil {
+			_ = owned.Close()
+		}
+	}()
 	delay := 100 * time.Millisecond
 	for ctx.Err() == nil {
-		err := watcher.watchSnapshot(ctx, func() { delay = 100 * time.Millisecond })
+		err := watcher.watchSnapshot(ctx, source, func() { delay = 100 * time.Millisecond })
 		if ctx.Err() != nil {
 			return
 		}
+		if owned != nil {
+			_ = owned.Close()
+		}
+		owned = clientv3.NewWatcher(watcher.client)
+		source = owned
 		if watcher.conn != nil {
 			watcher.conn.ReportError(err)
 		}
-		log.ZWarn(ctx, "etcd resolver watch failed, retrying", err,
+		log.ZWarn(ctx, "etcd watcher failed, retrying", err,
 			"prefix", watcher.prefix,
 			"retryDelay", delay,
 		)
@@ -144,7 +156,7 @@ func (watcher *endpointWatcher) run(ctx context.Context) {
 	}
 }
 
-func (watcher *endpointWatcher) watchSnapshot(parent context.Context, recovered func()) error {
+func (watcher *endpointWatcher) watchSnapshot(parent context.Context, source clientv3.Watcher, recovered func()) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	getCtx, getCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -158,14 +170,14 @@ func (watcher *endpointWatcher) watchSnapshot(parent context.Context, recovered 
 		watcher.setAddress(addresses, string(entry.Key), entry.Value)
 	}
 	watcher.publish(addresses)
-	updates := watcher.client.Watch(ctx, watcher.prefix, clientv3.WithPrefix(), clientv3.WithRev(snapshot.Header.Revision+1), clientv3.WithProgressNotify())
+	updates := source.Watch(ctx, watcher.prefix, clientv3.WithPrefix(), clientv3.WithRev(snapshot.Header.Revision+1), clientv3.WithProgressNotify())
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case update, open := <-updates:
 			if !open {
-				return errors.New("etcd resolver: watch closed")
+				return errors.New("etcd watcher: watch closed")
 			}
 			if err := update.Err(); err != nil {
 				return err
