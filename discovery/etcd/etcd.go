@@ -49,6 +49,7 @@ func NewSvcDiscoveryRegistry(rootDirectory string, endpoints []string, watchName
 	if err != nil {
 		return nil, err
 	}
+	client.Watcher = newReconnectingWatcher(client, client.Watcher)
 
 	log.ZInfo(context.Background(), "etcd client created",
 		"endpoints", cfg.Endpoints,
