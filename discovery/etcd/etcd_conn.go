@@ -27,7 +27,7 @@ type connPool struct {
 	serviceDialOptions map[string][]grpc.DialOption
 
 	watchersMu sync.Mutex
-	watchers   map[string]*endpointResolver // prefix -> *endpointResolver
+	watchers   map[string]*endpointWatcher // prefix -> *endpointWatcher
 	watchNames []string
 }
 
@@ -37,7 +37,7 @@ func newConnPool(client *clientv3.Client, rootDirectory string, watchNames []str
 		rootDirectory:      rootDirectory,
 		connMap:            make(map[string][]*grpc.ClientConn),
 		serviceDialOptions: make(map[string][]grpc.DialOption),
-		watchers:           make(map[string]*endpointResolver),
+		watchers:           make(map[string]*endpointWatcher),
 		watchNames:         watchNames,
 	}
 	cp.resolver = resolverBuilder{client: client, pool: cp}
@@ -49,7 +49,7 @@ func (cp *connPool) combineKeyWithPrefix(key string) string {
 	return fmt.Sprintf("%s/%s", cp.rootDirectory, key)
 }
 
-func (cp *connPool) getOrCreateWatcher(prefix string) (*endpointResolver, error) {
+func (cp *connPool) getOrCreateWatcher(prefix string) (*endpointWatcher, error) {
 	if !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
@@ -65,7 +65,7 @@ func (cp *connPool) getOrCreateWatcher(prefix string) (*endpointResolver, error)
 	}
 
 	ctx, cancel := context.WithCancel(cp.client.Ctx())
-	watcher := &endpointResolver{
+	watcher := &endpointWatcher{
 		client: cp.client,
 		prefix: prefix,
 		cancel: cancel,
@@ -84,7 +84,7 @@ func (cp *connPool) getOrCreateWatcher(prefix string) (*endpointResolver, error)
 	return watcher, nil
 }
 
-func (cp *connPool) ensureServiceWatcher(serviceName string) (*endpointResolver, error) {
+func (cp *connPool) ensureServiceWatcher(serviceName string) (*endpointWatcher, error) {
 	prefix := cp.combineKeyWithPrefix(serviceName)
 	return cp.getOrCreateWatcher(prefix)
 }
@@ -121,11 +121,11 @@ func (cp *connPool) watchServiceChanges() {
 
 func (cp *connPool) stopServiceWatches() {
 	cp.watchersMu.Lock()
-	watchers := make([]*endpointResolver, 0, len(cp.watchers))
+	watchers := make([]*endpointWatcher, 0, len(cp.watchers))
 	for _, w := range cp.watchers {
 		watchers = append(watchers, w)
 	}
-	cp.watchers = make(map[string]*endpointResolver)
+	cp.watchers = make(map[string]*endpointWatcher)
 	cp.watchersMu.Unlock()
 
 	for _, w := range watchers {
