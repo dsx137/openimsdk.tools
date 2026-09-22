@@ -41,7 +41,7 @@ func (builder resolverBuilder) Build(target resolver.Target, conn resolver.Clien
 	}
 
 	ctx, cancel := context.WithCancel(builder.client.Ctx())
-	watcher := &endpointResolver{
+	watcher := &endpointWatcher{
 		client: builder.client,
 		prefix: prefix,
 		conn:   conn,
@@ -53,7 +53,7 @@ func (builder resolverBuilder) Build(target resolver.Target, conn resolver.Clien
 	return watcher, nil
 }
 
-type endpointResolver struct {
+type endpointWatcher struct {
 	client *clientv3.Client
 	prefix string
 	conn   resolver.ClientConn
@@ -68,16 +68,16 @@ type endpointResolver struct {
 	readyOnce sync.Once
 }
 
-func (watcher *endpointResolver) ResolveNow(resolver.ResolveNowOptions) {}
+func (watcher *endpointWatcher) ResolveNow(resolver.ResolveNowOptions) {}
 
-func (watcher *endpointResolver) Close() {
+func (watcher *endpointWatcher) Close() {
 	if watcher.cancel != nil {
 		watcher.cancel()
 	}
 	<-watcher.done
 }
 
-func (watcher *endpointResolver) addListener(fn func([]resolver.Address)) (uint64, []resolver.Address) {
+func (watcher *endpointWatcher) addListener(fn func([]resolver.Address)) (uint64, []resolver.Address) {
 	watcher.mu.Lock()
 	defer watcher.mu.Unlock()
 	if watcher.listeners == nil {
@@ -93,7 +93,7 @@ func (watcher *endpointResolver) addListener(fn func([]resolver.Address)) (uint6
 	return id, current
 }
 
-func (watcher *endpointResolver) getAddresses() []resolver.Address {
+func (watcher *endpointWatcher) getAddresses() []resolver.Address {
 	watcher.mu.RLock()
 	defer watcher.mu.RUnlock()
 	if watcher.lastAddrs == nil {
@@ -102,13 +102,13 @@ func (watcher *endpointResolver) getAddresses() []resolver.Address {
 	return append([]resolver.Address(nil), watcher.lastAddrs...)
 }
 
-func (watcher *endpointResolver) removeListener(id uint64) {
+func (watcher *endpointWatcher) removeListener(id uint64) {
 	watcher.mu.Lock()
 	delete(watcher.listeners, id)
 	watcher.mu.Unlock()
 }
 
-func (watcher *endpointResolver) waitReady(ctx context.Context) error {
+func (watcher *endpointWatcher) waitReady(ctx context.Context) error {
 	if watcher.ready == nil {
 		return nil
 	}
@@ -122,7 +122,7 @@ func (watcher *endpointResolver) waitReady(ctx context.Context) error {
 	}
 }
 
-func (watcher *endpointResolver) run(ctx context.Context) {
+func (watcher *endpointWatcher) run(ctx context.Context) {
 	defer close(watcher.done)
 	delay := 100 * time.Millisecond
 	for ctx.Err() == nil {
@@ -144,7 +144,7 @@ func (watcher *endpointResolver) run(ctx context.Context) {
 	}
 }
 
-func (watcher *endpointResolver) watchSnapshot(parent context.Context, recovered func()) error {
+func (watcher *endpointWatcher) watchSnapshot(parent context.Context, recovered func()) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	getCtx, getCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -194,7 +194,7 @@ func (watcher *endpointResolver) watchSnapshot(parent context.Context, recovered
 	}
 }
 
-func (watcher *endpointResolver) setAddress(addresses map[string]resolver.Address, key string, value []byte) {
+func (watcher *endpointWatcher) setAddress(addresses map[string]resolver.Address, key string, value []byte) {
 	var endpoint endpoints.Endpoint
 	if err := json.Unmarshal(value, &endpoint); err == nil && isValidHostPort(endpoint.Addr) {
 		addresses[key] = resolver.Address{Addr: endpoint.Addr, Metadata: endpoint.Metadata}
@@ -226,7 +226,7 @@ func isValidHostPort(addr string) bool {
 	return err == nil && port > 0 && port <= 65535
 }
 
-func (watcher *endpointResolver) publish(addresses map[string]resolver.Address) {
+func (watcher *endpointWatcher) publish(addresses map[string]resolver.Address) {
 	keys := make([]string, 0, len(addresses))
 	for key := range addresses {
 		keys = append(keys, key)
@@ -267,7 +267,7 @@ func (watcher *endpointResolver) publish(addresses map[string]resolver.Address) 
 }
 
 type sharedResolverHandle struct {
-	watcher *endpointResolver
+	watcher *endpointWatcher
 	subID   uint64
 }
 
