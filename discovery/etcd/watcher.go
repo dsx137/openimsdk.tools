@@ -68,85 +68,73 @@ type endpointWatcher struct {
 	readyOnce sync.Once
 }
 
-func (watcher *endpointWatcher) ResolveNow(resolver.ResolveNowOptions) {}
+func (ew *endpointWatcher) ResolveNow(resolver.ResolveNowOptions) {}
 
-func (watcher *endpointWatcher) Close() {
-	if watcher.cancel != nil {
-		watcher.cancel()
+func (ew *endpointWatcher) Close() {
+	if ew.cancel != nil {
+		ew.cancel()
 	}
-	<-watcher.done
+	<-ew.done
 }
 
-func (watcher *endpointWatcher) addListener(fn func([]resolver.Address)) (uint64, []resolver.Address) {
-	watcher.mu.Lock()
-	defer watcher.mu.Unlock()
-	if watcher.listeners == nil {
-		watcher.listeners = make(map[uint64]func([]resolver.Address))
+func (ew *endpointWatcher) addListener(fn func([]resolver.Address)) (uint64, []resolver.Address) {
+	ew.mu.Lock()
+	defer ew.mu.Unlock()
+	if ew.listeners == nil {
+		ew.listeners = make(map[uint64]func([]resolver.Address))
 	}
-	watcher.nextSubID++
-	id := watcher.nextSubID
-	watcher.listeners[id] = fn
+	ew.nextSubID++
+	id := ew.nextSubID
+	ew.listeners[id] = fn
 	var current []resolver.Address
-	if watcher.lastAddrs != nil {
-		current = append([]resolver.Address(nil), watcher.lastAddrs...)
+	if ew.lastAddrs != nil {
+		current = append([]resolver.Address(nil), ew.lastAddrs...)
 	}
 	return id, current
 }
 
-func (watcher *endpointWatcher) getAddresses() []resolver.Address {
-	watcher.mu.RLock()
-	defer watcher.mu.RUnlock()
-	if watcher.lastAddrs == nil {
+func (ew *endpointWatcher) getAddresses() []resolver.Address {
+	ew.mu.RLock()
+	defer ew.mu.RUnlock()
+	if ew.lastAddrs == nil {
 		return nil
 	}
-	return append([]resolver.Address(nil), watcher.lastAddrs...)
+	return append([]resolver.Address(nil), ew.lastAddrs...)
 }
 
-func (watcher *endpointWatcher) removeListener(id uint64) {
-	watcher.mu.Lock()
-	delete(watcher.listeners, id)
-	watcher.mu.Unlock()
+func (ew *endpointWatcher) removeListener(id uint64) {
+	ew.mu.Lock()
+	delete(ew.listeners, id)
+	ew.mu.Unlock()
 }
 
-func (watcher *endpointWatcher) waitReady(ctx context.Context) error {
-	if watcher.ready == nil {
+func (ew *endpointWatcher) waitReady(ctx context.Context) error {
+	if ew.ready == nil {
 		return nil
 	}
 	select {
-	case <-watcher.ready:
+	case <-ew.ready:
 		return nil
-	case <-watcher.done:
+	case <-ew.done:
 		return errors.New("etcd watcher: closed")
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (watcher *endpointWatcher) run(ctx context.Context) {
-	defer close(watcher.done)
-	source := watcher.client.Watcher
-	var owned clientv3.Watcher
-	defer func() {
-		if owned != nil {
-			_ = owned.Close()
-		}
-	}()
+func (ew *endpointWatcher) run(ctx context.Context) {
+	defer close(ew.done)
 	delay := 100 * time.Millisecond
 	for ctx.Err() == nil {
-		err := watcher.watchSnapshot(ctx, source, func() { delay = 100 * time.Millisecond })
+		err := ew.watchSnapshot(ctx, func() { delay = 100 * time.Millisecond })
 		if ctx.Err() != nil {
 			return
 		}
-		if owned != nil {
-			_ = owned.Close()
-		}
-		owned = clientv3.NewWatcher(watcher.client)
-		source = owned
-		if watcher.conn != nil {
-			watcher.conn.ReportError(err)
+		if ew.conn != nil {
+			ew.conn.ReportError(err)
 		}
 		log.ZWarn(ctx, "etcd watcher failed, retrying", err,
-			"prefix", watcher.prefix,
+			"prefix", ew.prefix,
 			"retryDelay", delay,
 		)
 		if !sleepWithContext(ctx, delay) {
@@ -156,21 +144,21 @@ func (watcher *endpointWatcher) run(ctx context.Context) {
 	}
 }
 
-func (watcher *endpointWatcher) watchSnapshot(parent context.Context, source clientv3.Watcher, recovered func()) error {
+func (ew *endpointWatcher) watchSnapshot(parent context.Context, recovered func()) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	getCtx, getCancel := context.WithTimeout(ctx, 5*time.Second)
-	snapshot, err := watcher.client.Get(getCtx, watcher.prefix, clientv3.WithPrefix())
+	snapshot, err := ew.client.Get(getCtx, ew.prefix, clientv3.WithPrefix())
 	getCancel()
 	if err != nil {
 		return err
 	}
 	addresses := make(map[string]resolver.Address, len(snapshot.Kvs))
 	for _, entry := range snapshot.Kvs {
-		watcher.setAddress(addresses, string(entry.Key), entry.Value)
+		ew.setAddress(addresses, string(entry.Key), entry.Value)
 	}
-	watcher.publish(addresses)
-	updates := source.Watch(ctx, watcher.prefix, clientv3.WithPrefix(), clientv3.WithRev(snapshot.Header.Revision+1), clientv3.WithProgressNotify())
+	ew.publish(addresses)
+	updates := ew.client.Watch(ctx, ew.prefix, clientv3.WithPrefix(), clientv3.WithRev(snapshot.Header.Revision+1), clientv3.WithProgressNotify())
 	for {
 		select {
 		case <-ctx.Done():
@@ -189,7 +177,7 @@ func (watcher *endpointWatcher) watchSnapshot(parent context.Context, source cli
 				switch event.Type {
 				case clientv3.EventTypePut:
 					if event.Kv != nil {
-						watcher.setAddress(addresses, string(event.Kv.Key), event.Kv.Value)
+						ew.setAddress(addresses, string(event.Kv.Key), event.Kv.Value)
 					}
 				case clientv3.EventTypeDelete:
 					if event.Kv != nil {
@@ -200,13 +188,13 @@ func (watcher *endpointWatcher) watchSnapshot(parent context.Context, source cli
 				}
 			}
 			if len(update.Events) > 0 {
-				watcher.publish(addresses)
+				ew.publish(addresses)
 			}
 		}
 	}
 }
 
-func (watcher *endpointWatcher) setAddress(addresses map[string]resolver.Address, key string, value []byte) {
+func (ew *endpointWatcher) setAddress(addresses map[string]resolver.Address, key string, value []byte) {
 	var endpoint endpoints.Endpoint
 	if err := json.Unmarshal(value, &endpoint); err == nil && isValidHostPort(endpoint.Addr) {
 		addresses[key] = resolver.Address{Addr: endpoint.Addr, Metadata: endpoint.Metadata}
@@ -219,13 +207,13 @@ func (watcher *endpointWatcher) setAddress(addresses map[string]resolver.Address
 			return
 		}
 	}
-	if watcher.conn != nil {
+	if ew.conn != nil {
 		err := fmt.Errorf("invalid endpoint value at %s: %s", key, string(value))
 		log.ZWarn(context.Background(), "invalid endpoint in etcd", err,
 			"key", key,
-			"prefix", watcher.prefix,
+			"prefix", ew.prefix,
 		)
-		watcher.conn.ReportError(err)
+		ew.conn.ReportError(err)
 	}
 }
 
@@ -238,7 +226,7 @@ func isValidHostPort(addr string) bool {
 	return err == nil && port > 0 && port <= 65535
 }
 
-func (watcher *endpointWatcher) publish(addresses map[string]resolver.Address) {
+func (ew *endpointWatcher) publish(addresses map[string]resolver.Address) {
 	keys := make([]string, 0, len(addresses))
 	for key := range addresses {
 		keys = append(keys, key)
@@ -249,31 +237,31 @@ func (watcher *endpointWatcher) publish(addresses map[string]resolver.Address) {
 		addrs = append(addrs, addresses[key])
 	}
 	state := resolver.State{Addresses: addrs}
-	if watcher.conn != nil {
-		if err := watcher.conn.UpdateState(state); err != nil {
+	if ew.conn != nil {
+		if err := ew.conn.UpdateState(state); err != nil {
 			log.ZWarn(context.Background(), "etcd resolver update state failed", err,
-				"prefix", watcher.prefix,
+				"prefix", ew.prefix,
 				"addrCount", len(addrs),
 			)
-			watcher.conn.ReportError(err)
+			ew.conn.ReportError(err)
 		}
 	}
 
-	watcher.mu.Lock()
-	watcher.lastAddrs = addrs
+	ew.mu.Lock()
+	ew.lastAddrs = addrs
 	var fns []func([]resolver.Address)
-	for _, fn := range watcher.listeners {
+	for _, fn := range ew.listeners {
 		fns = append(fns, fn)
 	}
-	watcher.mu.Unlock()
+	ew.mu.Unlock()
 
 	for _, fn := range fns {
 		fn(addrs)
 	}
 
-	watcher.readyOnce.Do(func() {
-		if watcher.ready != nil {
-			close(watcher.ready)
+	ew.readyOnce.Do(func() {
+		if ew.ready != nil {
+			close(ew.ready)
 		}
 	})
 }
