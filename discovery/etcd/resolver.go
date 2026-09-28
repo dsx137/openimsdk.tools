@@ -41,7 +41,7 @@ func (builder resolverBuilder) Build(target resolver.Target, conn resolver.Clien
 	}
 
 	ctx, cancel := context.WithCancel(builder.client.Ctx())
-	watcher := &endpointWatcher{
+	rsv := &endpointResolver{
 		client: builder.client,
 		prefix: prefix,
 		conn:   conn,
@@ -49,11 +49,11 @@ func (builder resolverBuilder) Build(target resolver.Target, conn resolver.Clien
 		done:   make(chan struct{}),
 		ready:  make(chan struct{}),
 	}
-	go watcher.run(ctx)
-	return watcher, nil
+	go rsv.run(ctx)
+	return rsv, nil
 }
 
-type endpointWatcher struct {
+type endpointResolver struct {
 	client *clientv3.Client
 	prefix string
 	conn   resolver.ClientConn
@@ -68,16 +68,16 @@ type endpointWatcher struct {
 	readyOnce sync.Once
 }
 
-func (ew *endpointWatcher) ResolveNow(resolver.ResolveNowOptions) {}
+func (ew *endpointResolver) ResolveNow(resolver.ResolveNowOptions) {}
 
-func (ew *endpointWatcher) Close() {
+func (ew *endpointResolver) Close() {
 	if ew.cancel != nil {
 		ew.cancel()
 	}
 	<-ew.done
 }
 
-func (ew *endpointWatcher) addListener(fn func([]resolver.Address)) (uint64, []resolver.Address) {
+func (ew *endpointResolver) addListener(fn func([]resolver.Address)) (uint64, []resolver.Address) {
 	ew.mu.Lock()
 	defer ew.mu.Unlock()
 	if ew.listeners == nil {
@@ -93,7 +93,7 @@ func (ew *endpointWatcher) addListener(fn func([]resolver.Address)) (uint64, []r
 	return id, current
 }
 
-func (ew *endpointWatcher) getAddresses() []resolver.Address {
+func (ew *endpointResolver) getAddresses() []resolver.Address {
 	ew.mu.RLock()
 	defer ew.mu.RUnlock()
 	if ew.lastAddrs == nil {
@@ -102,13 +102,13 @@ func (ew *endpointWatcher) getAddresses() []resolver.Address {
 	return append([]resolver.Address(nil), ew.lastAddrs...)
 }
 
-func (ew *endpointWatcher) removeListener(id uint64) {
+func (ew *endpointResolver) removeListener(id uint64) {
 	ew.mu.Lock()
 	delete(ew.listeners, id)
 	ew.mu.Unlock()
 }
 
-func (ew *endpointWatcher) waitReady(ctx context.Context) error {
+func (ew *endpointResolver) waitReady(ctx context.Context) error {
 	if ew.ready == nil {
 		return nil
 	}
@@ -122,7 +122,7 @@ func (ew *endpointWatcher) waitReady(ctx context.Context) error {
 	}
 }
 
-func (ew *endpointWatcher) run(ctx context.Context) {
+func (ew *endpointResolver) run(ctx context.Context) {
 	defer close(ew.done)
 	delay := 100 * time.Millisecond
 	for ctx.Err() == nil {
@@ -144,7 +144,7 @@ func (ew *endpointWatcher) run(ctx context.Context) {
 	}
 }
 
-func (ew *endpointWatcher) watchSnapshot(parent context.Context, recovered func()) error {
+func (ew *endpointResolver) watchSnapshot(parent context.Context, recovered func()) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	getCtx, getCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -194,7 +194,7 @@ func (ew *endpointWatcher) watchSnapshot(parent context.Context, recovered func(
 	}
 }
 
-func (ew *endpointWatcher) setAddress(addresses map[string]resolver.Address, key string, value []byte) {
+func (ew *endpointResolver) setAddress(addresses map[string]resolver.Address, key string, value []byte) {
 	var endpoint endpoints.Endpoint
 	if err := json.Unmarshal(value, &endpoint); err == nil && isValidHostPort(endpoint.Addr) {
 		addresses[key] = resolver.Address{Addr: endpoint.Addr, Metadata: endpoint.Metadata}
@@ -226,7 +226,7 @@ func isValidHostPort(addr string) bool {
 	return err == nil && port > 0 && port <= 65535
 }
 
-func (ew *endpointWatcher) publish(addresses map[string]resolver.Address) {
+func (ew *endpointResolver) publish(addresses map[string]resolver.Address) {
 	keys := make([]string, 0, len(addresses))
 	for key := range addresses {
 		keys = append(keys, key)
@@ -267,12 +267,12 @@ func (ew *endpointWatcher) publish(addresses map[string]resolver.Address) {
 }
 
 type sharedResolverHandle struct {
-	watcher *endpointWatcher
-	subID   uint64
+	resolver *endpointResolver
+	subID    uint64
 }
 
 func (h *sharedResolverHandle) ResolveNow(resolver.ResolveNowOptions) {}
 
 func (h *sharedResolverHandle) Close() {
-	h.watcher.removeListener(h.subID)
+	h.resolver.removeListener(h.subID)
 }
