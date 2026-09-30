@@ -133,7 +133,7 @@ func (cp *connPool) GetConns(ctx context.Context, serviceName string, opts ...gr
 	fullServiceKey := cp.combineKeyWithPrefix(serviceName)
 	if len(opts) > 0 {
 		cp.mu.Lock()
-		cp.serviceDialOptions[fullServiceKey] = append([]grpc.DialOption(nil), opts...)
+		cp.serviceDialOptions[fullServiceKey] = datautil.CopySlice(opts)
 		cp.mu.Unlock()
 	}
 	watcher, err := cp.getOrCreateWatcher(cp.combineKeyWithPrefix(serviceName))
