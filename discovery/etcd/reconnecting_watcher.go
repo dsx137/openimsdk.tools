@@ -13,7 +13,7 @@ import (
 // Background:
 // In etcd clientv3, watch operations multiplex over shared gRPC streams. Authentication
 // tokens (such as short-lived JWTs) are only refreshed on unary RPC retries or when establishing
-// a brand new stream. An active watch stream never refreshes tokens in-place, and clientv3 exposes
+// a brand-new stream. An active watch stream never refreshes tokens in-place, and clientv3 exposes
 // no public API on Watcher to force stream recreation or token refresh. Once a token expires,
 // the stream halts with "etcdserver: invalid auth token", and watches reusing that stream become
 // trapped in an infinite retry loop.

@@ -17,31 +17,37 @@ import (
 )
 
 type connPool struct {
-	client        *clientv3.Client
-	rootDirectory string
-	resolver      resolver.Builder
+	client          *clientv3.Client
+	rootDirectory   string
+	resolverBuilder resolver.Builder
 
 	mu                 sync.RWMutex
-	connMap            map[string][]*grpc.ClientConn // fullServiceKey -> []*ClientConn
+	endpointConnMap    map[string][]*grpc.ClientConn // fullServiceKey -> []*ClientConn
+	serviceConns       map[string]*grpc.ClientConn
 	dialOptions        []grpc.DialOption
 	serviceDialOptions map[string][]grpc.DialOption
+	connectionsClosed  bool
 
-	resolversMu sync.Mutex
-	resolvers   map[string]*endpointResolver // prefix -> *endpointResolver
-	watchNames  []string
+	watchersMu sync.Mutex
+	watchers   map[string]*serviceWatcher
+	closed     bool
 }
 
 func newConnPool(client *clientv3.Client, rootDirectory string, watchNames []string) *connPool {
 	cp := &connPool{
 		client:             client,
 		rootDirectory:      rootDirectory,
-		connMap:            make(map[string][]*grpc.ClientConn),
+		endpointConnMap:    make(map[string][]*grpc.ClientConn),
+		serviceConns:       make(map[string]*grpc.ClientConn),
 		serviceDialOptions: make(map[string][]grpc.DialOption),
-		resolvers:          make(map[string]*endpointResolver),
-		watchNames:         watchNames,
+		watchers:           make(map[string]*serviceWatcher),
 	}
-	cp.resolver = resolverBuilder{client: client, pool: cp}
-	cp.watchServiceChanges()
+	cp.resolverBuilder = serviceResolverBuilder{pool: cp}
+	for _, service := range watchNames {
+		if _, err := cp.getOrCreateWatcher(cp.combineKeyWithPrefix(service)); err != nil {
+			log.ZWarn(context.Background(), "ensure service watcher err", err, zap.String("service", service))
+		}
+	}
 	return cp
 }
 
@@ -49,221 +55,125 @@ func (cp *connPool) combineKeyWithPrefix(key string) string {
 	return fmt.Sprintf("%s/%s", cp.rootDirectory, key)
 }
 
-func (cp *connPool) getOrCreateResolver(prefix string) (*endpointResolver, error) {
+func (cp *connPool) getOrCreateWatcher(prefix string) (*serviceWatcher, error) {
 	if !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
 
-	cp.resolversMu.Lock()
-	defer cp.resolversMu.Unlock()
+	cp.watchersMu.Lock()
+	defer cp.watchersMu.Unlock()
 
-	if rsv, ok := cp.resolvers[prefix]; ok {
-		return rsv, nil
-	}
-	if cp.client == nil {
+	if cp.closed || cp.client == nil {
 		return nil, fmt.Errorf("etcd client closed")
 	}
-
-	ctx, cancel := context.WithCancel(cp.client.Ctx())
-	rsv := &endpointResolver{
-		client: cp.client,
-		prefix: prefix,
-		cancel: cancel,
-		done:   make(chan struct{}),
-		ready:  make(chan struct{}),
+	if watch, ok := cp.watchers[prefix]; ok {
+		return watch, nil
 	}
 
-	serviceName := strings.TrimPrefix(prefix, cp.rootDirectory+"/")
-	serviceName = strings.TrimSuffix(serviceName, "/")
-	rsv.addListener(func(addrs []resolver.Address) {
-		cp.syncConnMap(serviceName, addrs)
-	})
-
-	cp.resolvers[prefix] = rsv
-	go rsv.run(ctx)
-	return rsv, nil
-}
-
-func (cp *connPool) ensureServiceResolver(serviceName string) (*endpointResolver, error) {
-	prefix := cp.combineKeyWithPrefix(serviceName)
-	return cp.getOrCreateResolver(prefix)
-}
-
-func (cp *connPool) buildSharedResolver(prefix string, conn resolver.ClientConn) (resolver.Resolver, error) {
-	rsv, err := cp.getOrCreateResolver(prefix)
-	if err != nil {
-		return nil, err
-	}
-
-	subID, initialAddrs := rsv.addListener(func(addrs []resolver.Address) {
-		if err := conn.UpdateState(resolver.State{Addresses: addrs}); err != nil {
-			conn.ReportError(err)
+	serviceName := strings.TrimSuffix(strings.TrimPrefix(prefix, cp.rootDirectory+"/"), "/")
+	watcher := newServiceWatcher(cp.client, prefix)
+	watcher.addListener(func(addresses []resolver.Address, err error) {
+		if err == nil {
+			cp.syncEndpointConnMap(serviceName, addresses)
 		}
 	})
-
-	if len(initialAddrs) > 0 {
-		_ = conn.UpdateState(resolver.State{Addresses: initialAddrs})
-	}
-
-	return &sharedResolverHandle{
-		resolver: rsv,
-		subID:    subID,
-	}, nil
+	cp.watchers[prefix] = watcher
+	return watcher, nil
 }
 
-func (cp *connPool) watchServiceChanges() {
-	for _, s := range cp.watchNames {
-		if _, err := cp.ensureServiceResolver(s); err != nil {
-			log.ZWarn(context.Background(), "ensure service watcher err", err, zap.String("service", s))
-		}
-	}
-}
-
-func (cp *connPool) stopServiceResolvers() {
-	cp.resolversMu.Lock()
-	rsvs := make([]*endpointResolver, 0, len(cp.resolvers))
-	for _, w := range cp.resolvers {
-		rsvs = append(rsvs, w)
-	}
-	cp.resolvers = make(map[string]*endpointResolver)
-	cp.resolversMu.Unlock()
-
-	for _, w := range rsvs {
-		w.Close()
-	}
-}
-
-func (cp *connPool) syncConnMap(serviceName string, addresses []resolver.Address) {
+func (cp *connPool) syncEndpointConnMap(serviceName string, addresses []resolver.Address) {
 	fullServiceKey := cp.combineKeyWithPrefix(serviceName)
-
-	newAddrMap := make(map[string]struct{}, len(addresses))
-	for _, a := range addresses {
-		if a.Addr != "" {
-			newAddrMap[a.Addr] = struct{}{}
-		}
-	}
-
 	cp.mu.Lock()
-	if cp.client == nil {
+	if cp.connectionsClosed {
 		cp.mu.Unlock()
 		return
 	}
-
-	oldList := cp.connMap[fullServiceKey]
-	oldAddresses := datautil.SliceToMapAny(oldList, func(e *grpc.ClientConn) (string, *grpc.ClientConn) { return e.Target(), e })
-
-	var toKeep []*grpc.ClientConn
-	var toAdd []string
+	old := make(map[string]*grpc.ClientConn)
+	for _, conn := range cp.endpointConnMap[fullServiceKey] {
+		old[conn.Target()] = conn
+	}
+	var current []*grpc.ClientConn
 	var toClose []*grpc.ClientConn
-
+	dialOpts := datautil.Flatten(cp.dialOptions, cp.serviceDialOptions[fullServiceKey], []grpc.DialOption{grpc.WithResolvers(cp.resolverBuilder)})
 	seen := make(map[string]struct{}, len(addresses))
-	for _, a := range addresses {
-		addr := a.Addr
+	for _, address := range addresses {
+		addr := address.Addr
 		if addr == "" {
 			continue
 		}
-		if _, exists := seen[addr]; exists {
+		if _, duplicate := seen[addr]; duplicate {
 			continue
 		}
 		seen[addr] = struct{}{}
-		if conn, ok := oldAddresses[addr]; ok {
-			toKeep = append(toKeep, conn)
+		if conn, ok := old[addr]; ok {
+			current = append(current, conn)
+			delete(old, addr)
+			continue
+		}
+		if conn, err := grpc.NewClient(addr, dialOpts...); err != nil {
+			log.ZWarn(context.Background(), "failed to dial new endpoint", err, zap.String("service", serviceName), zap.String("addr", addr))
 		} else {
-			toAdd = append(toAdd, addr)
+			current = append(current, conn)
 		}
 	}
-
-	for _, conn := range oldList {
-		if _, ok := newAddrMap[conn.Target()]; !ok {
-			toClose = append(toClose, conn)
-		}
+	for _, conn := range old {
+		toClose = append(toClose, conn)
 	}
-
-	cp.connMap[fullServiceKey] = toKeep
-
-	dialOpts := append([]grpc.DialOption{}, cp.dialOptions...)
-	if storedOpts, ok := cp.serviceDialOptions[fullServiceKey]; ok && len(storedOpts) > 0 {
-		dialOpts = append(dialOpts, storedOpts...)
-	}
-	dialOpts = append(dialOpts, grpc.WithResolvers(cp.resolver))
+	cp.endpointConnMap[fullServiceKey] = current
 	cp.mu.Unlock()
-
-	ctx := context.Background()
 	for _, conn := range toClose {
 		if err := conn.Close(); err != nil {
-			log.ZWarn(ctx, "failed to close stale conn", err, zap.String("service", serviceName), zap.String("addr", conn.Target()))
-		}
-	}
-
-	if len(toAdd) > 0 {
-		var newlyCreated []*grpc.ClientConn
-		for _, addr := range toAdd {
-			conn, err := grpc.NewClient(addr, dialOpts...)
-			if err != nil {
-				log.ZWarn(ctx, "failed to dial new endpoint", err, zap.String("service", serviceName), zap.String("addr", addr))
-				continue
-			}
-			newlyCreated = append(newlyCreated, conn)
-		}
-
-		if len(newlyCreated) > 0 {
-			cp.mu.Lock()
-			if currentList, ok := cp.connMap[fullServiceKey]; ok {
-				cp.connMap[fullServiceKey] = append(currentList, newlyCreated...)
-			} else {
-				for _, c := range newlyCreated {
-					_ = c.Close()
-				}
-			}
-			cp.mu.Unlock()
+			log.ZWarn(context.Background(), "failed to close stale conn", err, zap.String("service", serviceName), zap.String("addr", conn.Target()))
 		}
 	}
 }
 
 // GetConns returns gRPC client connections for a given service name
 func (cp *connPool) GetConns(ctx context.Context, serviceName string, opts ...grpc.DialOption) ([]grpc.ClientConnInterface, error) {
-	rsv, err := cp.ensureServiceResolver(serviceName)
-	if err != nil {
-		return nil, err
-	}
-
 	fullServiceKey := cp.combineKeyWithPrefix(serviceName)
-
 	if len(opts) > 0 {
 		cp.mu.Lock()
 		cp.serviceDialOptions[fullServiceKey] = append([]grpc.DialOption(nil), opts...)
 		cp.mu.Unlock()
 	}
+	watcher, err := cp.getOrCreateWatcher(cp.combineKeyWithPrefix(serviceName))
+	if err != nil {
+		return nil, err
+	}
 
 	waitCtx, cancel := withTimeout(ctx, 3*time.Second)
 	defer cancel()
-	_ = rsv.waitReady(waitCtx)
+	_ = watcher.waitReady(waitCtx)
 
 	cp.mu.RLock()
-	conns := cp.connMap[fullServiceKey]
+	conns := cp.endpointConnMap[fullServiceKey]
 	res := datautil.Slice(conns, func(e *grpc.ClientConn) grpc.ClientConnInterface { return e })
 	cp.mu.RUnlock()
-
-	if len(res) == 0 {
-		if addrs := rsv.getAddresses(); len(addrs) > 0 {
-			cp.syncConnMap(serviceName, addrs)
-			cp.mu.RLock()
-			conns = cp.connMap[fullServiceKey]
-			res = datautil.Slice(conns, func(e *grpc.ClientConn) grpc.ClientConnInterface { return e })
-			cp.mu.RUnlock()
-		}
-	}
 
 	return res, nil
 }
 
 // GetConn returns a single gRPC client connection for a given service name
 func (cp *connPool) GetConn(ctx context.Context, serviceName string, opts ...grpc.DialOption) (grpc.ClientConnInterface, error) {
+	if _, err := cp.getOrCreateWatcher(cp.combineKeyWithPrefix(serviceName)); err != nil {
+		return nil, err
+	}
 	target := fmt.Sprintf("etcd:///%s", cp.combineKeyWithPrefix(serviceName))
-
-	dialOpts := append(append(cp.dialOptions, opts...), grpc.WithResolvers(cp.resolver))
-
-	return grpc.NewClient(target, dialOpts...)
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	if cp.connectionsClosed {
+		return nil, fmt.Errorf("etcd connection pool closed")
+	}
+	if conn := cp.serviceConns[target]; conn != nil {
+		return conn, nil
+	}
+	dialOpts := datautil.Flatten(cp.dialOptions, opts, []grpc.DialOption{grpc.WithResolvers(cp.resolverBuilder)})
+	conn, err := grpc.NewClient(target, dialOpts...)
+	if err != nil {
+		return nil, err
+	}
+	cp.serviceConns[target] = conn
+	return conn, nil
 }
 
 // AddOption appends gRPC dial options to the existing options
@@ -280,41 +190,53 @@ func (cp *connPool) AddOption(opts ...grpc.DialOption) {
 		}
 	}
 
-	cp.resolversMu.Lock()
+	cp.watchersMu.Lock()
 	type syncItem struct {
 		serviceName string
 		addrs       []resolver.Address
 	}
 	var toSync []syncItem
-	for prefix, w := range cp.resolvers {
+	for prefix, w := range cp.watchers {
 		serviceName := strings.TrimPrefix(prefix, cp.rootDirectory+"/")
 		serviceName = strings.TrimSuffix(serviceName, "/")
 		if addrs := w.getAddresses(); len(addrs) > 0 {
 			toSync = append(toSync, syncItem{serviceName: serviceName, addrs: addrs})
 		}
 	}
-	cp.resolversMu.Unlock()
+	cp.watchersMu.Unlock()
 
 	for _, item := range toSync {
-		cp.syncConnMap(item.serviceName, item.addrs)
+		cp.syncEndpointConnMap(item.serviceName, item.addrs)
 	}
 }
 
 func (cp *connPool) resetConnMapLocked() []*grpc.ClientConn {
 	var toClose []*grpc.ClientConn
-	for _, conns := range cp.connMap {
+	for _, conns := range cp.endpointConnMap {
 		toClose = append(toClose, conns...)
 	}
-	cp.connMap = make(map[string][]*grpc.ClientConn)
+	cp.endpointConnMap = make(map[string][]*grpc.ClientConn)
 	return toClose
 }
 
 func (cp *connPool) close() {
-	cp.stopServiceResolvers()
-	cp.mu.Lock()
-	toClose := cp.resetConnMapLocked()
-	cp.mu.Unlock()
+	cp.watchersMu.Lock()
+	cp.closed = true
+	watchers := datautil.Values(cp.watchers)
+	cp.watchers = nil
+	cp.watchersMu.Unlock()
+	for _, w := range watchers {
+		w.close()
+	}
 
+	cp.mu.Lock()
+	cp.connectionsClosed = true
+	toClose := cp.resetConnMapLocked()
+	for _, conn := range cp.serviceConns {
+		toClose = append(toClose, conn)
+	}
+	cp.serviceConns = nil
+	cp.mu.Unlock()
 	for _, c := range toClose {
 		_ = c.Close()
 	}
