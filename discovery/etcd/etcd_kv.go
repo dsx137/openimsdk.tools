@@ -21,8 +21,14 @@ type kvHub struct {
 	watchMu      sync.Mutex
 	watchEntries map[string]*watchKeyEntry // key -> *watchKeyEntry
 
-	keepAliveMu      sync.Mutex
-	keepAliveCancels []context.CancelFunc
+	keepAliveMu sync.Mutex
+	keepAlives  []*kvKeepAlive
+}
+
+type kvKeepAlive struct {
+	cancel  context.CancelFunc
+	done    chan struct{}
+	leaseID clientv3.LeaseID
 }
 
 func newKVHub(client *clientv3.Client, rootDirectory string) *kvHub {
@@ -50,21 +56,33 @@ func (h *kvHub) keepAliveLease(ctx context.Context, leaseID clientv3.LeaseID) {
 	}
 }
 
-func (h *kvHub) newKVKeepAliveContext() context.Context {
+func (h *kvHub) newKVKeepAliveContext(id clientv3.LeaseID) (context.Context, *kvKeepAlive) {
 	ctx, cancel := context.WithCancel(context.Background())
+	keepAlive := &kvKeepAlive{cancel: cancel, done: make(chan struct{}), leaseID: id}
 	h.keepAliveMu.Lock()
-	h.keepAliveCancels = append(h.keepAliveCancels, cancel)
+	h.keepAlives = append(h.keepAlives, keepAlive)
 	h.keepAliveMu.Unlock()
-	return ctx
+	return ctx, keepAlive
 }
 
 func (h *kvHub) stopKVKeepAlives() {
 	h.keepAliveMu.Lock()
-	cancels := h.keepAliveCancels
-	h.keepAliveCancels = nil
+	keepAlives := h.keepAlives
+	h.keepAlives = nil
 	h.keepAliveMu.Unlock()
 
-	for _, cancel := range cancels {
+	for _, keepAlive := range keepAlives {
+		keepAlive.cancel()
+	}
+	for _, keepAlive := range keepAlives {
+		<-keepAlive.done
+	}
+	for _, keepAlive := range keepAlives {
+		ctx, cancel := withTimeout(context.Background(), defaultCloseTimeout)
+		if _, err := h.client.Revoke(ctx, keepAlive.leaseID); err != nil {
+			log.ZWarn(ctx, "revoke etcd key lease failed", err,
+				zap.Int64("leaseID", int64(keepAlive.leaseID)))
+		}
 		cancel()
 	}
 }
@@ -96,11 +114,12 @@ func (h *kvHub) SetWithLease(ctx context.Context, key string, val []byte, ttl in
 	if err != nil {
 		return errs.Wrap(err)
 	}
-	keepCtx := h.newKVKeepAliveContext()
+	keepCtx, keepAlive := h.newKVKeepAliveContext(id)
 
 	go func() {
+		defer close(keepAlive.done)
 		for {
-			h.keepAliveLease(keepCtx, id)
+			h.keepAliveLease(keepCtx, keepAlive.leaseID)
 			if keepCtx.Err() != nil {
 				return
 			}
@@ -110,7 +129,7 @@ func (h *kvHub) SetWithLease(ctx context.Context, key string, val []byte, ttl in
 				"etcd lease keepalive stopped, resetting key with lease",
 				nil,
 				zap.String("key", key),
-				zap.Int64("leaseID", int64(id)),
+				zap.Int64("leaseID", int64(keepAlive.leaseID)),
 			)
 
 			if !sleepWithContext(keepCtx, keepAliveRetryDelay) {
@@ -126,11 +145,11 @@ func (h *kvHub) SetWithLease(ctx context.Context, key string, val []byte, ttl in
 					"reset etcd key with lease failed",
 					err,
 					zap.String("key", key),
-					zap.Int64("leaseID", int64(id)),
+					zap.Int64("leaseID", int64(keepAlive.leaseID)),
 				)
 				continue
 			}
-			id = newID
+			keepAlive.leaseID = newID
 		}
 	}()
 
